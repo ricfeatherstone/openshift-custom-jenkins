@@ -1,0 +1,59 @@
+def name = 'jenkins'
+def repoUrl, namespace, currentImage, buildNumber
+
+stage('Build') {
+  repoUrl = "${scm.remoteRepositories[0].uris[0]}"
+  
+  openshift.withCluster() {
+    if(!openshift.selector('bc', name).exists()) {           
+      openshift.newBuild("--name=${name}", "jenkins:2~${repoUrl}", "--labels=app=${name}")
+    }
+               
+    build = openshift.startBuild(name, '--wait=true').narrow('build').object()
+      
+    namespace = build.status.config.namespace
+    imageDigest = build.status.output.to.imageDigest
+    buildNumber = "${build.metadata.annotations.get('openshift.io/build.number')}"
+    
+    currentImage = "${namespace}/${name}@${imageDigest}"
+  }
+}
+
+
+stage('Deploy and Validate') {
+  openshift.withCluster() {
+    deployName = "jenkins-test-${buildNumber}"
+    
+    openshift.newApp("--image=${currentImage}", "--name=${deployName}", "-e JENKINS_PASSWORD=admin")
+    openshift.selector('svc', deployName).expose()
+          
+    try {
+        timeout(time:10, unit:'MINUTES') {
+          input message:"Do you want to replace Jenkins with this image?", ok: 'Yes'
+        }
+    } finally {
+      openshift.delete('all', "-l=app=${deployName}")
+    }
+    
+    //statusCode = sh(returnStdout: true, script: "curl -s -o /dev/null -I -w '%{http_code}' -u admin:admin http://${deployName}:8080/robots.txt")
+  }
+}
+
+
+stage('Rollout') {
+  openshift.withCluster() {
+    jenkinsDeployment = openshift.selector('dc', name).object()
+    
+    if(jenkinsDeployment) {
+      jenkinsImage = jenkinsDeployment.spec.template.spec.containers[0].image
+            
+      if(!jenkinsImage.equals("${namespace}/${name}:stable")) {
+        jenkinsDeployment.spec.triggers[0].imageChangeParams.from.name = "${name}:stable"
+        jenkinsDeployment.spec.triggers[0].imageChangeParams.from.namespace = "${namespace}"
+        openshift.apply(jenkinsDeployment)
+      }
+    }
+    
+    openshift.tag(currentImage, "${namespace}/${name}:stable")
+  }
+}
